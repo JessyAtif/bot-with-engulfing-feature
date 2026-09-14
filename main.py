@@ -22,9 +22,6 @@ TELEGRAM_CHAT_ID = '@brainlifttrader'
 MIN_PRICE = 0.0000001
 COOLDOWN_SECONDS = 60
 VOL_REQ_15M = 1000000      # 1M Volume
-GAP_THRESHOLD = 0.005
-MIN_SPREAD_PERCENT = 0.2
-MAX_SPREAD_PERCENT = 1.0
 
 # --- GLOBAL VARIABLES ---
 processed_coins = {}
@@ -32,8 +29,7 @@ analysis_queue = queue.Queue()
 is_first_run = True 
 
 # --- FOLDER SETUP ---
-desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
-BASE_FOLDER = os.path.join(desktop_path, "Scanner_Alerts")
+BASE_FOLDER = os.path.join(os.getcwd(), "Scanner_Alerts")
 FOLDER_15M = os.path.join(BASE_FOLDER, "Strategy_Charts")
 
 if not os.path.exists(FOLDER_15M):
@@ -85,33 +81,70 @@ def send_telegram_alert(image_path, caption):
         log(f"❌ Error sending chart to Telegram: {e}")
 
 # ==========================================
-# 🟢 ENGULFING STRATEGY LOGIC
+# 🟢 NEW SNIPER STRATEGY LOGIC
 # ==========================================
-def detect_engulfing(prev, curr):
+def detect_sniper_signal(df):
     """
-    Checks if a proper Engulfing candle occurred WITH a dynamic EMA touch/rejection.
-    Returns: Signal Name, Touched EMA name, Calculated Stop Loss
+    Evaluates the strict trending and bouncing engulfing logic.
+    Returns: 'BUY', 'SELL', or None
     """
-    emas = ['ema9', 'ema20', 'ema100']
+    if len(df) < 20:
+        return None
+        
+    curr = df.iloc[-1]
+    prev = df.iloc[-2]
     
-    for ema in emas:
-        # 1. BULLISH ENGULFING (Red followed by Green)
-        if prev['close'] < prev['open'] and curr['close'] > curr['open']:
-            if curr['close'] >= prev['open'] and curr['open'] <= prev['close']:
-                # EMA Touch (Support Check)
-                if curr['low'] <= curr[ema] and curr['close'] > curr[ema]:
-                    sl = min(curr['low'], prev['low']) # SL below recent swing low
-                    return "BULLISH_ENGULFING", ema, sl
-                    
-        # 2. BEARISH ENGULFING (Green followed by Red)
-        elif prev['close'] > prev['open'] and curr['close'] < curr['open']:
-            if curr['close'] <= prev['open'] and curr['open'] >= prev['close']:
-                # EMA Touch (Resistance Check)
-                if curr['high'] >= curr[ema] and curr['close'] < curr[ema]:
-                    sl = max(curr['high'], prev['high']) # SL above recent swing high
-                    return "BEARISH_ENGULFING", ema, sl
-                    
-    return None, None, None
+    # --- FILTER 0: AVOID SIDEWAYS MARKET ---
+    # 0.2% gap minimum
+    gap = abs(curr['ema9'] - curr['ema20']) / curr['ema20']
+    if gap <= 0.002:
+        return None
+        
+    # Check last 10 candles for trend consistency
+    last_10 = df.iloc[-10:]
+    bullish_trend = all(row['ema9'] > row['ema20'] for _, row in last_10.iterrows())
+    bearish_trend = all(row['ema9'] < row['ema20'] for _, row in last_10.iterrows())
+    
+    if not bullish_trend and not bearish_trend:
+        return None
+
+    # Identify candle colors and volume
+    curr_is_green = curr['close'] > curr['open']
+    curr_is_red = curr['close'] < curr['open']
+    prev_is_green = prev['close'] > prev['open']
+    prev_is_red = prev['close'] < prev['open']
+    
+    vol_higher = curr['volume'] > prev['volume']
+    
+    # --- BULLISH SIGNAL ---
+    if bullish_trend:
+        # 1. Bouncing from EMA 9 and 20
+        bouncing = (curr['low'] <= curr['ema20'] * 1.005) and (curr['close'] >= curr['ema9'])
+        
+        # 2. Wick-to-wick bullish engulfing
+        engulfing = (curr['high'] > prev['high']) and (curr['low'] < prev['low'])
+        
+        # 3. Volume & Color validation (Current Green > Prev Red)
+        color_check = curr_is_green and prev_is_red
+        
+        if bouncing and engulfing and vol_higher and color_check:
+            return "BUY"
+
+    # --- BEARISH SIGNAL ---
+    if bearish_trend:
+        # 1. Rejecting from EMA 9 and 20
+        rejecting = (curr['high'] >= curr['ema20'] * 0.995) and (curr['close'] <= curr['ema9'])
+        
+        # 2. Wick-to-wick bearish engulfing
+        engulfing = (curr['low'] < prev['low']) and (curr['high'] > prev['high'])
+        
+        # 3. Volume & Color validation (Current Red > Prev Green)
+        color_check = curr_is_red and prev_is_green
+        
+        if rejecting and engulfing and vol_higher and color_check:
+            return "SELL"
+            
+    return None
 
 def get_24h_stats(symbol):
     try:
@@ -126,7 +159,6 @@ def get_24h_stats(symbol):
 # ==========================================
 def analyze_and_chart(symbol):
     try:
-        # Fetch data using Binance API
         session = requests.Session()
         adapter = requests.adapters.HTTPAdapter(max_retries=3)
         session.mount('https://', adapter)
@@ -145,38 +177,15 @@ def analyze_and_chart(symbol):
 
         df['ema9'] = df['close'].ewm(span=9, adjust=False).mean()
         df['ema20'] = df['close'].ewm(span=20, adjust=False).mean()
-        df['ema100'] = df['close'].ewm(span=100, adjust=False).mean()
+        df['ema100'] = df['close'].ewm(span=100, adjust=False).mean() # Kept strictly for chart visualization
+
+        signal_detected = detect_sniper_signal(df)
+
+        if not signal_detected: 
+            return None, None, None, None, None, None
 
         curr = df.iloc[-1]
-        prev = df.iloc[-2]
-        
-        signal_detected = None
-        ema_touched = None
-        stop_loss = None
-        
-        gap_percent = ((curr['ema9'] - curr['ema20']) / curr['ema20']) * 100
-        is_spread_valid = MIN_SPREAD_PERCENT <= gap_percent <= MAX_SPREAD_PERCENT
-
-        # 🧠 1. CHECK ENGULFING STRATEGY FIRST
-        eng_signal, eng_ema, eng_sl = detect_engulfing(prev, curr)
-        
-        if eng_signal:
-            signal_detected = eng_signal
-            ema_touched = eng_ema
-            stop_loss = eng_sl
-        else:
-            # 🧠 2. CHECK EXISTING STRATEGIES
-            if prev['ema9'] <= prev['ema20'] and curr['ema9'] > curr['ema20']:
-                signal_detected = "CROSSOVER"
-            elif curr['ema9'] > curr['ema20'] and curr['ema20'] > curr['ema100']:
-                if is_spread_valid:
-                    if curr['low'] <= curr['ema9'] and curr['close'] > curr['ema20']:
-                        signal_detected = "SUPER_SIGNAL"
-
-        # If no signal found, ignore and exit
-        if not signal_detected: 
-            return None, None, None, None, None, None, None, None
-
+        gap_percent = (abs(curr['ema9'] - curr['ema20']) / curr['ema20']) * 100
         current_price = curr['close']
         change_24h, vol_24h = get_24h_stats(symbol)
 
@@ -201,22 +210,18 @@ def analyze_and_chart(symbol):
         fig.subplots_adjust(bottom=0.15) 
         fig.savefig(save_path, bbox_inches='tight', dpi=100)
         
-        return signal_detected, save_path, gap_percent, current_price, change_24h, vol_24h, ema_touched, stop_loss
+        return signal_detected, save_path, gap_percent, current_price, change_24h, vol_24h
 
     except Exception as e:
         log(f"Error charting {symbol}: {e}")
-        return None, None, None, None, None, None, None, None
+        return None, None, None, None, None, None
 
 def process_strategy(symbol):
     """Processes signals and formats telegram captions intelligently."""
-    signal, image_path, gap, price, change, vol, ema_touched, sl = analyze_and_chart(symbol)
+    signal, image_path, gap, price, change, vol = analyze_and_chart(symbol)
     
     if signal and image_path:
-        # Display PAXGUSDT clearly as Gold in Telegram
-        if symbol == "PAXGUSDT":
-            clean_symbol = "Gold (PAXG)"
-        else:
-            clean_symbol = symbol.replace('USDT', '')
+        clean_symbol = "Gold (PAXG)" if symbol == "PAXGUSDT" else symbol.replace('USDT', '')
         
         def format_num(num):
             if num >= 1_000_000: return f"{num/1_000_000:.1f}M"
@@ -226,36 +231,30 @@ def process_strategy(symbol):
         vol_formatted = format_num(vol)
 
         # 📨 TELEGRAM TEXT FORMATTING
-        if "ENGULFING" in signal:
-            direction = "🟢 LONG (Buy)" if signal == "BULLISH_ENGULFING" else "🔴 SHORT (Sell)"
+        if signal == "BUY":
             caption = (
-                f"🔥 *${clean_symbol}* | EMA Engulfing\n\n"
-                f"🚨 *Signal:* {direction}\n"
-                f"💰 *Entry Price:* {price}\n"
-                f"🛡️ *Dynamic S/R:* {ema_touched.upper()} Touch\n"
-                f"🛑 *Stop Loss:* {sl:.4f} (Swing Point)\n\n"
-                f"⚠️ *Rules:* SL/TP fix rakhein. No FOMO!"
-            )
-        elif signal == "SUPER_SIGNAL":
-            caption = (
-                f"💎 *${clean_symbol}* | #{symbol}\n"
+                f"🟢 *BULLISH SNIPER ENTRY* 🟢\n"
+                f"💎 *${clean_symbol}* | #{symbol}\n\n"
                 f"Price: {price} ({change:+.1f}% in 24h)\n"
-                f"Strategy: Gap + Pullback (15m)\n"
+                f"Setup: EMA 9/20 Bounce + Outside Engulfing\n"
+                f"Trend: Confirmed Bullish (10+ Candles)\n"
                 f"Spread Gap: {gap:.2f}%\n"
-                f"24h Vol: {vol_formatted} USDT (Binance)"
+                f"24h Vol: {vol_formatted} USDT"
             )
         else:
             caption = (
-                f"🚀 *${clean_symbol}* | #{symbol}\n"
+                f"🔴 *BEARISH SNIPER ENTRY* 🔴\n"
+                f"💎 *${clean_symbol}* | #{symbol}\n\n"
                 f"Price: {price} ({change:+.1f}% in 24h)\n"
-                f"Strategy: Fresh EMA 9/20 Crossover (15m)\n"
-                f"24h Vol: {vol_formatted} USDT (Binance)"
+                f"Setup: EMA 9/20 Reject + Outside Engulfing\n"
+                f"Trend: Confirmed Bearish (10+ Candles)\n"
+                f"Spread Gap: {gap:.2f}%\n"
+                f"24h Vol: {vol_formatted} USDT"
             )
 
         log(f"🎯 {signal} triggered on {symbol}")
         send_telegram_alert(image_path, caption)
         
-        # Cleanup image
         try: os.remove(image_path)
         except: pass
         
@@ -269,7 +268,11 @@ def worker_thread():
     """Crypto & PAXG Gold Worker (Binance Websocket Queue)"""
     while True:
         symbol = analysis_queue.get()
-        process_strategy(symbol)
+        alert_sent = process_strategy(symbol)
+        
+        if alert_sent:
+            time.sleep(3)
+            
         analysis_queue.task_done()
 
 # ==========================================
@@ -279,7 +282,7 @@ def on_message(ws, message):
     global is_first_run
     
     if is_first_run:
-        startup_msg = "✅ *Atif Bhai Ka Bot Zinda Hai!*\n\n📡 Scanning Binance for Crypto & Gold (PAXGUSDT) Engulfing...\n⏳ Wait for signals..."
+        startup_msg = "✅ *Atif Bhai Ka Bot Zinda Hai!*\n\n📡 Scanning Binance for Strict Trend & Wick Engulfing...\n⏳ Wait for signals..."
         send_telegram_text(startup_msg)
         is_first_run = False
 
@@ -317,6 +320,6 @@ def run_bot():
 # 🟢 APP STARTUP
 # ==========================================
 if __name__ == "__main__":
-    keep_alive()  # Starts the Flask Server 
-    Thread(target=worker_thread, daemon=True).start() # Starts Queue processing
-    run_bot()     # Starts WebSocket (Blocking main thread)
+    keep_alive()  
+    Thread(target=worker_thread, daemon=True).start() 
+    run_bot()

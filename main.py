@@ -11,6 +11,11 @@ import warnings
 import queue
 from datetime import datetime
 
+# 🔥 MEMORY LEAK FIX IMPORTS 🔥
+import matplotlib
+matplotlib.use('Agg')  # Force headless non-interactive backend
+import matplotlib.pyplot as plt
+
 # --- CONFIGURATION ---
 warnings.filterwarnings("ignore")
 
@@ -210,9 +215,14 @@ def analyze_and_chart(symbol):
         fig.subplots_adjust(bottom=0.15) 
         fig.savefig(save_path, bbox_inches='tight', dpi=100)
         
+        # 🔥 MEMORY LEAK FIX: Explicitly close figure and clear memory 🔥
+        plt.close(fig)
+        plt.close('all')
+        
         return signal_detected, save_path, gap_percent, current_price, change_24h, vol_24h
 
     except Exception as e:
+        plt.close('all')  # 🔥 Clear memory if plotting failed
         log(f"Error charting {symbol}: {e}")
         return None, None, None, None, None, None
 
